@@ -2,7 +2,7 @@
   {% for shift in shifts %}
   <li class="timeline-item">
     <div class="timeline-rail" aria-hidden="true">
-      <span class="timeline-dot status-{{ card_status.get(shift.clamp_id, shift.clamp.status) }}"></span>
+      <span class="timeline-dot status-{{ shift.clamp.status }}"></span>
     </div>
     <article class="timeline-card">
       <header class="timeline-card-head">
@@ -28,7 +28,7 @@
         </div>
         <div class="metric">
           <span>窑态</span>
-          <strong class="badge badge-{{ card_status.get(shift.clamp_id, shift.clamp.status) }}">{{ status_labels.get(card_status.get(shift.clamp_id, shift.clamp.status), shift.clamp.status) }}</strong>
+          <strong class="badge badge-{{ shift.clamp.status }}">{{ status_labels.get(shift.clamp.status, shift.clamp.status) }}</strong>
         </div>
       </div>
       {% if shift.notes %}

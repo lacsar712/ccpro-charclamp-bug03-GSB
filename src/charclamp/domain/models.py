@@ -46,8 +46,13 @@ class Clamp(Base):
     site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), nullable=False)
     code: Mapped[str] = mapped_column(String(40), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default=STATUS_STACKED)
+    # 窑态乐观锁：任何改态写入都带 status_version 条件并自动递增，
+    # 并发改同一窑时只有一笔 UPDATE 能命中行，其余抛 StaleDataError
+    status_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     wood_species: Mapped[str] = mapped_column(String(80), nullable=False, default="")
     notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    __mapper_args__ = {"version_id_col": status_version}
 
     site: Mapped[Site] = relationship(back_populates="clamps")
     shifts: Mapped[list[BurnShift]] = relationship(

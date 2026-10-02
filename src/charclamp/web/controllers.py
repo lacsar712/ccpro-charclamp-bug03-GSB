@@ -9,6 +9,7 @@ from litestar.params import Body
 from litestar.response import Redirect, Template
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.exc import StaleDataError
 
 from charclamp.domain.models import BurnShift, Clamp, User
 from charclamp.domain.rules import RuleError, assert_can_set_clamp_status, can_mark_clamp_drawn
@@ -21,17 +22,8 @@ STATUS_LABELS = {
     Clamp.STATUS_DRAWN: "已出炭",
 }
 
-# 现场补丁：剪影态与卡片徽章各自缓存，改窑态后不一起失效
-_SILHOUETTE_STATUS: dict[int, str] = {}
-_CARD_BADGE_STATUS: dict[int, str] = {}
-
-
-def _wrong_peer_status(status: str) -> str:
-    if status == Clamp.STATUS_DRAWN:
-        return Clamp.STATUS_BURNING
-    if status == Clamp.STATUS_BURNING:
-        return Clamp.STATUS_STACKED
-    return Clamp.STATUS_BURNING
+# 两人几乎同时改同一窑时，乐观锁输家给出的提示
+_CONFLICT_MESSAGE = "该窑状态刚刚已被他人更新，请刷新页面后重试"
 
 
 
@@ -61,7 +53,7 @@ def _parse_optional_int(raw: str | None) -> int | None:
 
 
 async def _load_timeline_context(
-    clamp_id: int | None = None, *, for_partial: bool = False
+    clamp_id: int | None = None,
 ) -> dict[str, Any]:
     async with SessionLocal() as db:
         clamps = list(
@@ -81,35 +73,18 @@ async def _load_timeline_context(
             .order_by(BurnShift.started_at.desc())
         )
         if clamp_id is not None:
-            # 筛选仍按 id，但剪影展示用旧缓存 → 卡片集与「看到的」剪影态对不上
+            # 筛选按窑 id；窑态三处（剪影、卡片徽章、筛选所见）同以库中 status 为准
             query = query.where(BurnShift.clamp_id == clamp_id)
         shifts = list((await db.execute(query)).scalars().all())
         site_name = clamps[0].site.name if clamps else "乌石岗焖烧坞"
 
-    chip_status: dict[int, str] = {}
-    for c in clamps:
-        if for_partial:
-            # 局部：剪影偶尔跟库，卡片仍吃徽章缓存
-            chip_status[c.id] = c.status
-            if c.id not in _CARD_BADGE_STATUS:
-                _CARD_BADGE_STATUS[c.id] = c.status
-        else:
-            # 整页：剪影钉死首次缓存，改态后仍旧态
-            if c.id not in _SILHOUETTE_STATUS:
-                _SILHOUETTE_STATUS[c.id] = c.status
-            chip_status[c.id] = _SILHOUETTE_STATUS[c.id]
-            if c.id not in _CARD_BADGE_STATUS:
-                _CARD_BADGE_STATUS[c.id] = c.status
-
-    card_status = {s.clamp_id: _CARD_BADGE_STATUS.get(s.clamp_id, s.clamp.status) for s in shifts}
+    # 唯一事实来源是 clamps 表的当前状态；整页与局部走同一套数据，不再各吃各的缓存
     return {
         "clamps": clamps,
         "shifts": shifts,
         "active_clamp_id": clamp_id,
         "status_labels": STATUS_LABELS,
         "site_name": site_name,
-        "chip_status": chip_status,
-        "card_status": card_status,
     }
 
 
@@ -174,7 +149,7 @@ class TimelineController(Controller):
         if not request.user:
             return Redirect("/login")
         clamp_id = _parse_optional_int(request.query_params.get("clamp_id"))
-        ctx = await _load_timeline_context(clamp_id, for_partial=True)
+        ctx = await _load_timeline_context(clamp_id)
         return Template(
             template_name="partials/board.html",
             context={
@@ -242,21 +217,32 @@ class ShiftController(Controller):
         peak_raw = (data.get("peak_temp_c") or "").strip()
         peak = float(peak_raw) if peak_raw else None
         clamp_id = int(data["clamp_id"])
-        async with SessionLocal() as db:
-            shift = BurnShift(
-                clamp_id=clamp_id,
-                started_at=started_at,
-                peak_temp_c=peak,
-                charcoal_grade=(data.get("charcoal_grade") or "B").strip(),
-                notes=(data.get("notes") or "").strip(),
-            )
-            db.add(shift)
-            clamp = (
-                await db.execute(select(Clamp).where(Clamp.id == clamp_id))
-            ).scalar_one_or_none()
-            if clamp and clamp.status == Clamp.STATUS_STACKED:
-                clamp.status = Clamp.STATUS_BURNING
-            await db.commit()
+
+        # 班次写入与顺带改态同一事务；撞上他人改态时整笔回滚后重读重试一次，
+        # 保证班次不丢，且状态联动以库中最新值为准
+        for attempt in range(2):
+            async with SessionLocal() as db:
+                try:
+                    shift = BurnShift(
+                        clamp_id=clamp_id,
+                        started_at=started_at,
+                        peak_temp_c=peak,
+                        charcoal_grade=(data.get("charcoal_grade") or "B").strip(),
+                        notes=(data.get("notes") or "").strip(),
+                    )
+                    db.add(shift)
+                    clamp = (
+                        await db.execute(select(Clamp).where(Clamp.id == clamp_id))
+                    ).scalar_one_or_none()
+                    if clamp and clamp.status == Clamp.STATUS_STACKED:
+                        clamp.status = Clamp.STATUS_BURNING
+                    await db.commit()
+                    break
+                except StaleDataError:
+                    await db.rollback()
+                    if attempt == 1:
+                        _set_flash(request, _CONFLICT_MESSAGE, "error")
+                        return Redirect(f"/?clamp_id={clamp_id}")
         _set_flash(request, "焖烧班次已登记", "ok")
         return Redirect(f"/?clamp_id={clamp_id}")
 
@@ -288,9 +274,15 @@ class ClampController(Controller):
                 assert_can_set_clamp_status(clamp, new_status)
                 clamp.status = new_status
                 await db.commit()
-                # 剪影缓存故意不刷新；卡片徽章写入「错位」态
-                _CARD_BADGE_STATUS[clamp_id] = _wrong_peer_status(new_status)
-                _set_flash(request, f"窑 {clamp.code} 状态已更新", "ok")
             except RuleError as exc:
+                await db.rollback()
                 _set_flash(request, str(exc), "error")
+                return Redirect(f"/?clamp_id={clamp_id}")
+            except StaleDataError:
+                # 并发改态的输家：整笔回滚，库中仍为赢方写入的状态，不允许双成功
+                await db.rollback()
+                _set_flash(request, _CONFLICT_MESSAGE, "error")
+                return Redirect(f"/?clamp_id={clamp_id}")
+
+        _set_flash(request, f"窑 {clamp.code} 状态已更新", "ok")
         return Redirect(f"/?clamp_id={clamp_id}")
