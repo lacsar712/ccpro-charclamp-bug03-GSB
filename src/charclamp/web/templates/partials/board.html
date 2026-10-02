@@ -17,13 +17,13 @@
   </a>
   {% for clamp in clamps %}
   <a
-    class="kiln-chip status-{{ chip_status.get(clamp.id, clamp.status) }} {% if active_clamp_id == clamp.id %}is-active{% endif %}"
+    class="kiln-chip status-{{ clamp.status }} {% if active_clamp_id == clamp.id %}is-active{% endif %}"
     href="/?clamp_id={{ clamp.id }}"
     hx-get="/timeline/partial?clamp_id={{ clamp.id }}"
     hx-target="#board"
     hx-swap="innerHTML"
     hx-push-url="/?clamp_id={{ clamp.id }}"
-    title="{{ status_labels.get(chip_status.get(clamp.id, clamp.status), clamp.status) }}"
+    title="{{ status_labels.get(clamp.status, clamp.status) }}"
   >
     <span class="kiln-svg" aria-hidden="true">
       <svg viewBox="0 0 48 56" width="44" height="50">
@@ -35,7 +35,7 @@
     </span>
     <span class="kiln-meta">
       <strong>{{ clamp.code }}</strong>
-      <em>{{ status_labels.get(chip_status.get(clamp.id, clamp.status), clamp.status) }} · {{ clamp.wood_species or '—' }}</em>
+      <em>{{ status_labels.get(clamp.status, clamp.status) }} · {{ clamp.wood_species or '—' }}</em>
     </span>
   </a>
   {% endfor %}

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncGenerator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -27,6 +27,15 @@ SyncSessionLocal = sessionmaker(sync_engine, expire_on_commit=False, class_=Sess
 
 def sync_create_all() -> None:
     Base.metadata.create_all(sync_engine)
+    # create_all 不补已有表的列；旧卷里的 clamps 缺 lock_version，
+    # 用 IF NOT EXISTS 幂等补上，存量行取默认版本 0。
+    with sync_engine.begin() as conn:
+        conn.execute(
+            text(
+                "ALTER TABLE clamps "
+                "ADD COLUMN IF NOT EXISTS lock_version INTEGER NOT NULL DEFAULT 0"
+            )
+        )
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:

@@ -5,6 +5,9 @@ from datetime import datetime, timezone
 from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+# 并发改窑态的乐观锁版本列：每次状态变更 +1，UPDATE 必须带版本条件。
+CLAMP_LOCK_VERSION_INITIAL = 0
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -46,6 +49,11 @@ class Clamp(Base):
     site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), nullable=False)
     code: Mapped[str] = mapped_column(String(40), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default=STATUS_STACKED)
+    # 乐观锁：改窑态的 UPDATE 带 WHERE lock_version = :old，成功后 +1。
+    # 两人同时改同一窑时，只有一笔能匹配到行，另一笔 rowcount=0 必须失败回滚。
+    lock_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=CLAMP_LOCK_VERSION_INITIAL, server_default="0"
+    )
     wood_species: Mapped[str] = mapped_column(String(80), nullable=False, default="")
     notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
 

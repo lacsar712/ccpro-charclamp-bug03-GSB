@@ -11,6 +11,10 @@ class RuleError(ValueError):
     """业务规则校验失败。"""
 
 
+class ConcurrentStatusUpdate(RuleError):
+    """乐观锁冲突：本窑窑态已被另一笔更新先提交，当前这笔必须作废。"""
+
+
 def latest_shift_for_clamp(clamp: Clamp) -> BurnShift | None:
     if not clamp.shifts:
         return None

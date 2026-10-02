@@ -7,11 +7,16 @@ from litestar import Controller, MediaType, Request, get, post
 from litestar.enums import RequestEncodingType
 from litestar.params import Body
 from litestar.response import Redirect, Template
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 
 from charclamp.domain.models import BurnShift, Clamp, User
-from charclamp.domain.rules import RuleError, assert_can_set_clamp_status, can_mark_clamp_drawn
+from charclamp.domain.rules import (
+    ConcurrentStatusUpdate,
+    RuleError,
+    assert_can_set_clamp_status,
+    can_mark_clamp_drawn,
+)
 from charclamp.infra.db import SessionLocal
 from charclamp.infra.security import verify_password
 
@@ -20,19 +25,6 @@ STATUS_LABELS = {
     Clamp.STATUS_BURNING: "焖烧中",
     Clamp.STATUS_DRAWN: "已出炭",
 }
-
-# 现场补丁：剪影态与卡片徽章各自缓存，改窑态后不一起失效
-_SILHOUETTE_STATUS: dict[int, str] = {}
-_CARD_BADGE_STATUS: dict[int, str] = {}
-
-
-def _wrong_peer_status(status: str) -> str:
-    if status == Clamp.STATUS_DRAWN:
-        return Clamp.STATUS_BURNING
-    if status == Clamp.STATUS_BURNING:
-        return Clamp.STATUS_STACKED
-    return Clamp.STATUS_BURNING
-
 
 
 def _set_flash(request: Request, message: str, category: str = "ok") -> None:
@@ -60,9 +52,9 @@ def _parse_optional_int(raw: str | None) -> int | None:
         return None
 
 
-async def _load_timeline_context(
-    clamp_id: int | None = None, *, for_partial: bool = False
-) -> dict[str, Any]:
+async def _load_timeline_context(clamp_id: int | None = None) -> dict[str, Any]:
+    # 剪影、卡片圆点、卡片徽章全部直接取数据库当前 status，
+    # 整页与局部刷新走同一查询、同一渲染数据，三处天然一致。
     async with SessionLocal() as db:
         clamps = list(
             (
@@ -81,36 +73,41 @@ async def _load_timeline_context(
             .order_by(BurnShift.started_at.desc())
         )
         if clamp_id is not None:
-            # 筛选仍按 id，但剪影展示用旧缓存 → 卡片集与「看到的」剪影态对不上
             query = query.where(BurnShift.clamp_id == clamp_id)
         shifts = list((await db.execute(query)).scalars().all())
         site_name = clamps[0].site.name if clamps else "乌石岗焖烧坞"
 
-    chip_status: dict[int, str] = {}
-    for c in clamps:
-        if for_partial:
-            # 局部：剪影偶尔跟库，卡片仍吃徽章缓存
-            chip_status[c.id] = c.status
-            if c.id not in _CARD_BADGE_STATUS:
-                _CARD_BADGE_STATUS[c.id] = c.status
-        else:
-            # 整页：剪影钉死首次缓存，改态后仍旧态
-            if c.id not in _SILHOUETTE_STATUS:
-                _SILHOUETTE_STATUS[c.id] = c.status
-            chip_status[c.id] = _SILHOUETTE_STATUS[c.id]
-            if c.id not in _CARD_BADGE_STATUS:
-                _CARD_BADGE_STATUS[c.id] = c.status
-
-    card_status = {s.clamp_id: _CARD_BADGE_STATUS.get(s.clamp_id, s.clamp.status) for s in shifts}
     return {
         "clamps": clamps,
         "shifts": shifts,
         "active_clamp_id": clamp_id,
         "status_labels": STATUS_LABELS,
         "site_name": site_name,
-        "chip_status": chip_status,
-        "card_status": card_status,
     }
+
+
+async def _commit_clamp_status(
+    db: Any, clamp: Clamp, new_status: str, *, only_from: str | None = None
+) -> bool:
+    """
+    以乐观锁条件 UPDATE 改窑态。
+
+    WHERE 同时带上本请求读到的 lock_version：两人几乎同时改同一窑时，
+    先提交者版本号 +1，后提交者匹配不到行（rowcount=0），
+    只能整体回滚失败——绝不允许两笔都成功、三处与库不一致。
+
+    only_from 非空时额外要求旧 status 匹配（用于登记班次时的自动点火）。
+    返回是否真的改到了行。
+    """
+    conditions = [Clamp.id == clamp.id, Clamp.lock_version == clamp.lock_version]
+    if only_from is not None:
+        conditions.append(Clamp.status == only_from)
+    result = await db.execute(
+        update(Clamp)
+        .where(*conditions)
+        .values(status=new_status, lock_version=Clamp.lock_version + 1)
+    )
+    return result.rowcount == 1
 
 
 class AuthController(Controller):
@@ -174,7 +171,7 @@ class TimelineController(Controller):
         if not request.user:
             return Redirect("/login")
         clamp_id = _parse_optional_int(request.query_params.get("clamp_id"))
-        ctx = await _load_timeline_context(clamp_id, for_partial=True)
+        ctx = await _load_timeline_context(clamp_id)
         return Template(
             template_name="partials/board.html",
             context={
@@ -255,7 +252,12 @@ class ShiftController(Controller):
                 await db.execute(select(Clamp).where(Clamp.id == clamp_id))
             ).scalar_one_or_none()
             if clamp and clamp.status == Clamp.STATUS_STACKED:
-                clamp.status = Clamp.STATUS_BURNING
+                # 自动点火同样走带版本的条件 UPDATE：与手动改态撞车时
+                # 只有一笔能改窑态；本笔若没抢到（rowcount=0），
+                # 不覆盖对方结果，班次本身照常登记。
+                await _commit_clamp_status(
+                    db, clamp, Clamp.STATUS_BURNING, only_from=Clamp.STATUS_STACKED
+                )
             await db.commit()
         _set_flash(request, "焖烧班次已登记", "ok")
         return Redirect(f"/?clamp_id={clamp_id}")
@@ -285,12 +287,19 @@ class ClampController(Controller):
             if not clamp:
                 return Redirect("/")
             try:
+                # 规则校验基于本请求读到的窑态（含班次峰值）。
                 assert_can_set_clamp_status(clamp, new_status)
-                clamp.status = new_status
+                # 不改 ORM 属性，直接发带版本条件的 UPDATE：
+                # 两人同时改同一窑，只有 lock_version 仍匹配的那笔能成功。
+                changed = await _commit_clamp_status(db, clamp, new_status)
+                if not changed:
+                    # 版本已被并发的另一笔推进：本笔作废，三处以库里已提交的窑态为准。
+                    raise ConcurrentStatusUpdate(
+                        f"窑 {clamp.code} 窑态刚被他人更新，请刷新后按最新窑态操作"
+                    )
                 await db.commit()
-                # 剪影缓存故意不刷新；卡片徽章写入「错位」态
-                _CARD_BADGE_STATUS[clamp_id] = _wrong_peer_status(new_status)
                 _set_flash(request, f"窑 {clamp.code} 状态已更新", "ok")
             except RuleError as exc:
+                await db.rollback()
                 _set_flash(request, str(exc), "error")
         return Redirect(f"/?clamp_id={clamp_id}")
